@@ -19,9 +19,9 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
     """
 
     BODY_THRESHOLD = -600     # body vs air
-    XY_MARGIN = 40            # keep context around thorax
-    Z_MARGIN = 8              # keep some superior/inferior context
-    OUTSIDE_VALUE = -1000.0   # air-like value for outside-body voxels
+    XY_MARGIN = 40            # keep thoracic context
+    Z_MARGIN = 8              # keep superior/inferior context
+    OUTSIDE_VALUE = -1000.0   # air-like value outside the body
 
     def run_case_npy(
         self,
@@ -47,7 +47,6 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
 
         print("USING ImageTBADBodyCropPreprocessor")
 
-        # custom conservative preprocessing
         data, seg, bbox, body_mask = self.body_crop_trim_and_suppress(data, seg)
 
         properties['bbox_used_for_cropping'] = bbox
@@ -59,7 +58,7 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
 
         new_shape = compute_new_shape(data.shape[1:], original_spacing, target_spacing)
 
-        # keep nnU-Net's standard normalization
+        # Keep nnU-Net's own CT normalization
         data = self._normalize(
             data,
             seg,
@@ -67,7 +66,7 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
             plans_manager.foreground_intensity_properties_per_channel
         )
 
-        # standard nnU-Net resampling
+        # Standard nnU-Net resampling
         data = configuration_manager.resampling_fn_data(
             data, new_shape, original_spacing, target_spacing
         )
@@ -75,7 +74,7 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
             seg, new_shape, original_spacing, target_spacing
         )
 
-        # required for nnU-Net training patch sampling
+        # Required for nnU-Net patch sampling during training
         if seg is not None:
             label_manager = plans_manager.get_label_manager(dataset_json)
             collect_for_this = (
@@ -108,7 +107,7 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
         # 1) rough body mask
         body_mask = image > self.BODY_THRESHOLD
 
-        # 2) fill holes slice-wise to make body region more stable
+        # 2) fill holes slice-wise for more stable body region
         filled_mask = np.zeros_like(body_mask, dtype=bool)
         for z in range(body_mask.shape[0]):
             filled_mask[z] = binary_fill_holes(body_mask[z])
