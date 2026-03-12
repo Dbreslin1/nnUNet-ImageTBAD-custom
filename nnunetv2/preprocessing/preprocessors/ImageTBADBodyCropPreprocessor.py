@@ -14,8 +14,9 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
     2. Keep only the largest connected body component
     3. Crop in XY with a generous margin
     4. Trim only clearly empty z-slices at top/bottom
-    5. Suppress voxels outside the body mask
-    6. Let nnU-Net keep its own CT normalization + resampling
+    5. Mark outside-body voxels as -1 in seg (ignored during training)
+    6. Suppress data voxels outside the body mask
+    7. Let nnU-Net keep its own CT normalization + resampling
     """
 
     BODY_THRESHOLD = -600     # body vs air
@@ -33,6 +34,7 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
         dataset_json: Union[dict, str]
     ):
         data = data.astype(np.float32)
+        has_seg = seg is not None
         if seg is not None:
             assert data.shape[1:] == seg.shape[1:]
             seg = np.copy(seg)
@@ -45,8 +47,7 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
         original_spacing = [properties['spacing'][i] for i in plans_manager.transpose_forward]
         properties['shape_before_cropping'] = data.shape[1:]
 
-        print("USING ImageTBADBodyCropPreprocessor")
-
+        # body_crop_trim_and_suppress always returns a valid seg (creates one if None)
         data, seg, bbox, body_mask = self.body_crop_trim_and_suppress(data, seg)
 
         properties['bbox_used_for_cropping'] = bbox
@@ -58,7 +59,7 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
 
         new_shape = compute_new_shape(data.shape[1:], original_spacing, target_spacing)
 
-        # Keep nnU-Net's own CT normalization
+        # Normalize BEFORE resampling (matches default nnU-Net order)
         data = self._normalize(
             data,
             seg,
@@ -74,8 +75,8 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
             seg, new_shape, original_spacing, target_spacing
         )
 
-        # Required for nnU-Net patch sampling during training
-        if seg is not None:
+        # Foreground sampling only for training cases (where seg was provided)
+        if has_seg:
             label_manager = plans_manager.get_label_manager(dataset_json)
             collect_for_this = (
                 label_manager.foreground_regions
@@ -91,16 +92,20 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
             )
 
             seg = self.modify_seg_fn(seg, plans_manager, dataset_json, configuration_manager)
-            if np.max(seg) > 127:
-                seg = seg.astype(np.int16)
-            else:
-                seg = seg.astype(np.int8)
+
+        # Always cast seg dtype (seg is guaranteed non-None after body_crop_trim_and_suppress)
+        if np.max(seg) > 127:
+            seg = seg.astype(np.int16)
+        else:
+            seg = seg.astype(np.int8)
 
         return data, seg, properties
 
     def body_crop_trim_and_suppress(self, data, seg):
         """
-        Assumes data shape (C, Z, Y, X)
+        Assumes data shape (C, Z, Y, X).
+        Always returns a valid seg (creates one from body mask if input seg is None).
+        Outside-body voxels are marked as -1 in seg so training loss ignores them.
         """
         image = data[0]
 
@@ -122,9 +127,11 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
         else:
             body_mask = filled_mask
 
-        # fallback: if mask is empty, do nothing
+        # fallback: if mask is empty, skip cropping/suppression
         if not np.any(body_mask):
             bbox = [[0, data.shape[1]], [0, data.shape[2]], [0, data.shape[3]]]
+            if seg is None:
+                seg = np.zeros((1,) + data.shape[1:], dtype=np.int8)
             return data, seg, bbox, body_mask
 
         # 4) XY crop with margin
@@ -154,7 +161,14 @@ class ImageTBADBodyCropPreprocessor(DefaultPreprocessor):
         # crop body mask to same region
         body_mask = body_mask[z_min:z_max, y_min:y_max, x_min:x_max]
 
-        # 6) suppress outside-body voxels
+        # Mark outside-body voxels as -1 in seg (matches nnU-Net's nonzero mask convention).
+        # This prevents training loss from being computed on air/table/padding voxels.
+        if seg is not None:
+            seg[(seg == 0) & (~body_mask[None])] = -1
+        else:
+            seg = np.where(body_mask[None], np.int8(0), np.int8(-1))
+
+        # 6) suppress outside-body voxels in data
         for c in range(data.shape[0]):
             data[c][~body_mask] = self.OUTSIDE_VALUE
 
